@@ -1,0 +1,8 @@
+# Development override: exposes PostgreSQL on 127.0.0.1:5533 so that `pnpm dev`,
+# migrations and integration tests can run on the host.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres minio minio-init
+services:
+  postgres:
+    ports:
+      - '127.0.0.1:5533:5432'
+    networks: [backend, frontend]

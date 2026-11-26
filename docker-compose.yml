@@ -1,0 +1,134 @@
+# PSU Knowledge Platform — local deployment
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose logs -f app
+# NEVER run `docker compose down -v` in normal development: it deletes the database and file volumes.
+name: psu-blog-km-api
+
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://${APP_DB_USER:?}:${APP_DB_PASSWORD:?}@postgres:5432/${APP_DB_NAME:-psu_kp}
+  PAYLOAD_SECRET: ${PAYLOAD_SECRET:?PAYLOAD_SECRET is required}
+  NEXT_PUBLIC_SERVER_URL: ${NEXT_PUBLIC_SERVER_URL:-http://localhost:3100}
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?}
+  MINIO_BUCKET: ${MINIO_BUCKET:-psu-knowledge-media}
+  MINIO_REGION: ${MINIO_REGION:-us-east-1}
+  AUTH_PROVIDER: ${AUTH_PROVIDER:-mock}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+
+services:
+  postgres:
+    image: postgres:17.12-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?}
+      POSTGRES_DB: postgres
+      APP_DB_USER: ${APP_DB_USER:?}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?}
+      APP_DB_NAME: ${APP_DB_NAME:-psu_kp}
+      APP_TEST_DB_NAME: ${APP_TEST_DB_NAME:-psu_kp_test}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${APP_DB_NAME}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [backend]
+    # No published port: PostgreSQL is reachable only on the internal network.
+    # For host-side development/tests use: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+  minio:
+    # Upstream MinIO no longer publishes community images (repo archived 2026-04).
+    # Chainguard rebuild of MinIO (AGPLv3), pinned by digest. See README "Dependency risks".
+    image: cgr.dev/chainguard/minio@sha256:e9cf6b99c226e9539ed0f14b6f00e37b07da153c7ba1f4f8709c807574b471ec
+    restart: unless-stopped
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?}
+    volumes:
+      - minio-data:/data
+    ports:
+      - '127.0.0.1:9100:9000' # S3 API
+      - '127.0.0.1:9101:9001' # Console
+    networks: [backend, frontend]
+
+  minio-init:
+    # Creates the (private) bucket; exits when done. Retries until MinIO is up.
+    image: cgr.dev/chainguard/minio-client@sha256:94433f625c8057d18c69675dbaa33da6e4864f084f9c44faf30d3eb8e3754e0b
+    restart: on-failure
+    environment:
+      MC_HOST_local: http://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio:9000
+    command: ['mb', '--ignore-existing', 'local/${MINIO_BUCKET:-psu-knowledge-media}', 'local/${MINIO_TEST_BUCKET:-psu-knowledge-media-test}']
+    depends_on:
+      minio:
+        condition: service_started
+    networks: [backend]
+
+  api:
+    build:
+      context: .
+      target: runner
+      args:
+        NEXT_PUBLIC_SERVER_URL: ${NEXT_PUBLIC_SERVER_URL:-http://localhost:3100}
+    image: psu-blog-km-api:local
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    ports:
+      - '${APP_BIND:-127.0.0.1}:3101:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3000/api/health']
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks: [backend, frontend, gateway]
+
+  # One-off tooling container (migrations, seed, type generation) built from the builder stage.
+  #   docker compose --profile tools run --rm tools pnpm payload migrate
+  #   docker compose --profile tools run --rm tools pnpm seed
+  tools:
+    profiles: ['tools']
+    build:
+      context: .
+      target: builder
+      args:
+        NEXT_PUBLIC_SERVER_URL: ${NEXT_PUBLIC_SERVER_URL:-http://localhost:3100}
+    image: psu-blog-km-api:tools
+    environment:
+      <<: *app-env
+      NODE_ENV: development
+      SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:-}
+    volumes:
+      - ./src/migrations:/app/src/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks: [backend]
+
+volumes:
+  pgdata:
+  minio-data:
+
+networks:
+  backend:
+    internal: true
+  frontend:
+  gateway:
+    name: psu-blog-km-gateway
